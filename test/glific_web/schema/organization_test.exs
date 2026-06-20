@@ -1,6 +1,7 @@
 defmodule GlificWeb.Schema.OrganizationTest do
   use GlificWeb.ConnCase
   use Wormwood.GQLCase
+  import Mock
 
   alias Glific.{
     Enums.OrganizationStatus,
@@ -621,7 +622,15 @@ defmodule GlificWeb.Schema.OrganizationTest do
       organization_id: attrs.organization_id
     }
 
-    {:ok, _credential} = Partners.create_credential(valid_attrs)
+    with_mock(Goth.Token, [],
+      fetch: fn _source ->
+        {:ok, %{token: "0xFAKETOKEN_Q=", expires: System.system_time(:second) + 120}}
+      end
+    ) do
+      Tesla.Mock.mock(fn _ -> %Tesla.Env{status: 200, body: "{}"} end)
+      {:ok, _credential} = Partners.create_credential(valid_attrs)
+    end
+
     result = auth_query_gql_by(:get_services, user)
     assert {:ok, query_data} = result
     services = get_in(query_data, [:data, "organizationServices"])
@@ -635,9 +644,7 @@ defmodule GlificWeb.Schema.OrganizationTest do
     assert services["auto_translation_enabled"] == false
     assert services["whatsapp_group_enabled"] == false
     assert services["whatsapp_forms_enabled"] == false
-    assert services["unified_api_enabled"] == false
     assert services["certificate_enabled"] == false
-    assert services["kaapi_enabled"] == false
   end
 
   test "update an organization with organization settings", %{user: user} do

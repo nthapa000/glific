@@ -1,10 +1,8 @@
 defmodule Glific.AIEvaluationsTest do
   @moduledoc false
-  use Glific.DataCase, async: true
+  use Glific.DataCase, async: false
 
   import Ecto.Query
-
-  import Swoosh.TestAssertions
 
   alias Glific.{
     AIEvaluations,
@@ -13,7 +11,6 @@ defmodule Glific.AIEvaluationsTest do
     AIEvaluations.OrganizationEvalRequest,
     Assistants.Assistant,
     Assistants.AssistantConfigVersion,
-    Communications.Mailer,
     Notifications,
     Notifications.Notification,
     Partners,
@@ -115,13 +112,13 @@ defmodule Glific.AIEvaluationsTest do
       %{config_version: config_version}
     end
 
-    test "marks processing evaluation older than 6 hours as failed", %{
+    test "marks processing evaluation older than 24 hours as failed", %{
       organization_id: organization_id,
       config_version: config_version
     } do
       evaluation =
         create_evaluation(organization_id, config_version.id, %{status: :processing})
-        |> backdate_evaluation(7)
+        |> backdate_evaluation(25)
 
       notification_count =
         Notifications.count_notifications(%{filter: %{organization_id: organization_id}})
@@ -148,11 +145,11 @@ defmodule Glific.AIEvaluationsTest do
     } do
       completed =
         create_evaluation(organization_id, config_version.id, %{status: :completed})
-        |> backdate_evaluation(7)
+        |> backdate_evaluation(25)
 
       failed =
         create_evaluation(organization_id, config_version.id, %{status: :failed})
-        |> backdate_evaluation(7)
+        |> backdate_evaluation(25)
 
       AIEvaluations.poll_and_update(organization_id)
 
@@ -383,28 +380,53 @@ defmodule Glific.AIEvaluationsTest do
 
   describe "request_eval_access/1" do
     test "creates a new request with status requested", %{organization_id: organization_id} do
+      Application.put_env(:glific, :discord_webhook_url, "https://discord.test/webhook")
+      on_exit(fn -> Application.delete_env(:glific, :discord_webhook_url) end)
+
+      Tesla.Mock.mock(fn %{method: :post} -> %Tesla.Env{status: 200, body: ""} end)
+
       assert {:ok, %OrganizationEvalRequest{status: "requested"}} =
                AIEvaluations.request_eval_access(organization_id)
     end
 
-    test "sends email to glific support on new request", %{organization_id: organization_id} do
+    test "sends Discord notification on new request", %{organization_id: organization_id} do
+      Application.put_env(:glific, :discord_webhook_url, "https://discord.test/webhook")
+      on_exit(fn -> Application.delete_env(:glific, :discord_webhook_url) end)
+
+      test_pid = self()
+
+      Tesla.Mock.mock(fn %{method: :post} = env ->
+        send(test_pid, {:discord_called, env.body})
+        %Tesla.Env{status: 200, body: ""}
+      end)
+
       AIEvaluations.request_eval_access(organization_id)
 
-      assert_email_sent(fn email ->
-        email.subject =~ "AI Evaluations Access Request" and
-          email.to == [Mailer.glific_support()]
-      end)
+      assert_received {:discord_called, body}
+      decoded = Jason.decode!(body)
+      [embed] = decoded["embeds"]
+      assert embed["title"] =~ "AI Evaluations Access Request"
     end
 
-    test "returns existing request and does not send email when request already exists", %{
+    test "returns existing request and does not send Discord notification again", %{
       organization_id: organization_id
     } do
+      Application.put_env(:glific, :discord_webhook_url, "https://discord.test/webhook")
+      on_exit(fn -> Application.delete_env(:glific, :discord_webhook_url) end)
+
+      test_pid = self()
+
+      Tesla.Mock.mock(fn %{method: :post} = env ->
+        send(test_pid, {:discord_called, env.body})
+        %Tesla.Env{status: 200, body: ""}
+      end)
+
       {:ok, first} = AIEvaluations.request_eval_access(organization_id)
       {:ok, second} = AIEvaluations.request_eval_access(organization_id)
 
       assert first.id == second.id
-      assert_email_sent(subject: ~r/AI Evaluations Access Request/)
-      refute_email_sent(subject: ~r/AI Evaluations Access Request/)
+      assert_received {:discord_called, _}
+      refute_received {:discord_called, _}
     end
   end
 

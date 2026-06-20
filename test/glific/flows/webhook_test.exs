@@ -2,6 +2,8 @@ defmodule Glific.Flows.WebhookTest do
   use Glific.DataCase, async: true
   use Oban.Pro.Testing, repo: Glific.Repo
 
+  import Mock
+
   alias Glific.Flows.{
     Action,
     FlowContext,
@@ -12,8 +14,11 @@ defmodule Glific.Flows.WebhookTest do
 
   alias Glific.{
     Fixtures,
+    Partners,
     Seeds.SeedsDev
   }
+
+  alias Glific.ThirdParty.Kaapi
 
   setup do
     default_provider = SeedsDev.seed_providers()
@@ -199,6 +204,41 @@ defmodule Glific.Flows.WebhookTest do
       assert webhook_log.url == "www.one.com/#{contact_id}"
     end
 
+    test "execute redacts credential headers before persisting the webhook log", attrs do
+      Tesla.Mock.mock(fn
+        %{method: :post} -> %Tesla.Env{status: 200, body: Jason.encode!(@results)}
+      end)
+
+      attrs = %{
+        flow_id: 1,
+        flow_uuid: Ecto.UUID.generate(),
+        contact_id: Fixtures.contact_fixture(attrs).id,
+        organization_id: attrs.organization_id
+      }
+
+      {:ok, context} = FlowContext.create_flow_context(attrs)
+      context = Repo.preload(context, [:contact, :flow])
+
+      action = %Action{
+        headers: %{
+          "Accept" => "application/json",
+          "Authorization" => "Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
+          "X-API-KEY" => "kp_live_super_secret_value_123"
+        },
+        method: "POST",
+        url: "some url",
+        body: Jason.encode!(@action_body)
+      }
+
+      assert Webhook.execute(action, context) == nil
+      webhook_log = List.first(WebhookLog.list_webhook_logs(%{filter: attrs}))
+
+      # benign header kept, credential-bearing headers masked
+      assert webhook_log.request_headers["Accept"] == "application/json"
+      assert webhook_log.request_headers["Authorization"] == "[REDACTED]"
+      assert webhook_log.request_headers["X-API-KEY"] == "[REDACTED]"
+    end
+
     test "execute a webhook for post method should not break and update the webhook log in case of array/list response",
          attrs do
       Tesla.Mock.mock(fn
@@ -348,6 +388,77 @@ defmodule Glific.Flows.WebhookTest do
       Fixtures.webhook_log_fixture(attrs)
 
       assert WebhookLog.count_webhook_logs(%{filter: attrs}) == logs_count + 1
+    end
+  end
+
+  describe "Webhook.update_log/2 failure handling" do
+    test "records %{success: false, reason: _} as status 400 with the reason as error", attrs do
+      webhook_log = Fixtures.webhook_log_fixture(attrs)
+      result = %{success: false, reason: "Kaapi STT failed"}
+
+      assert {:ok, log} = Webhook.update_log(webhook_log, result)
+      assert log.status_code == 400
+      assert log.error == "Kaapi STT failed"
+      assert log.response_json == result
+    end
+
+    test "falls back to :error when :reason is absent", attrs do
+      webhook_log = Fixtures.webhook_log_fixture(attrs)
+      result = %{success: false, error: "Bad input"}
+
+      assert {:ok, log} = Webhook.update_log(webhook_log, result)
+      assert log.status_code == 400
+      assert log.error == "Bad input"
+    end
+
+    test "falls back to :message when :reason and :error are absent", attrs do
+      webhook_log = Fixtures.webhook_log_fixture(attrs)
+      result = %{success: false, message: "Something went wrong"}
+
+      assert {:ok, log} = Webhook.update_log(webhook_log, result)
+      assert log.status_code == 400
+      assert log.error == "Something went wrong"
+    end
+
+    test "defaults to a generic error when no reason-like field is present", attrs do
+      webhook_log = Fixtures.webhook_log_fixture(attrs)
+      result = %{success: false}
+
+      assert {:ok, log} = Webhook.update_log(webhook_log, result)
+      assert log.status_code == 400
+      assert log.error == "Webhook failure"
+    end
+
+    test "leaves success maps as status 200 with no error", attrs do
+      webhook_log = Fixtures.webhook_log_fixture(attrs)
+      result = %{success: true, parsed_msg: "ok"}
+
+      assert {:ok, log} = Webhook.update_log(webhook_log, result)
+      assert log.status_code == 200
+      assert log.error == nil
+    end
+
+    test "treats a map without a success key as a 200 response(for get_buttons and check_response webhook)",
+         attrs do
+      webhook_log = Fixtures.webhook_log_fixture(attrs)
+      result = %{response: "ok", extra: 1}
+
+      assert {:ok, log} = Webhook.update_log(webhook_log, result)
+      assert log.status_code == 200
+      assert log.error == nil
+    end
+
+    test "handles non-binary reason (e.g. a decoded JSON map) without crashing", attrs do
+      webhook_log = Fixtures.webhook_log_fixture(attrs)
+      # Bhasini sets %{success: false, reason: body} on a 500 with body being a
+      # decoded JSON map. to_string/1 would raise on that; the cond path uses
+      # inspect/1 instead so the log row still gets written.
+      result = %{success: false, reason: %{"error" => "upstream blew up"}}
+
+      assert {:ok, log} = Webhook.update_log(webhook_log, result)
+      assert log.status_code == 400
+      assert is_binary(log.error)
+      assert String.contains?(log.error, "upstream blew up")
     end
   end
 
@@ -626,5 +737,68 @@ defmodule Glific.Flows.WebhookTest do
     [job] = all_enqueued(worker: Webhook, prefix: "global")
     assert job.queue == "gpt_webhook_queue"
     assert job.priority == 2
+  end
+
+  describe "execute_unified_voice_filesearch/2 failure reporting" do
+    setup do
+      {:ok, _credential} =
+        Partners.create_credential(%{
+          organization_id: 1,
+          shortcode: "kaapi",
+          keys: %{},
+          secrets: %{"api_key" => "sk_test_key"},
+          is_active: true
+        })
+
+      Partners.get_organization!(1) |> Partners.fill_cache()
+      :ok
+    end
+
+    test "catches a raised exception, reports it to AppSignal, and reraises it" do
+      test_pid = self()
+
+      # With Kaapi creds present, unified_llm_and_wait injects the API key via
+      # Map.put(action.headers, ...). A nil headers map raises BadMapError -- exactly
+      # the kind of unexpected failure with_failure_reporting must catch and report.
+      action = %Action{headers: nil, method: "FUNCTION", url: "voice-filesearch-gpt", body: "{}"}
+      context = %FlowContext{organization_id: 1}
+
+      with_mocks([
+        {Kaapi, [],
+         [
+           fetch_kaapi_creds: fn _org_id -> {:ok, %{"api_key" => "sk_test_key"}} end
+         ]},
+        {Appsignal, [:passthrough],
+         [
+           send_error: fn exception, _stack, configurator ->
+             send(test_pid, {:appsignal_exception, exception})
+             configurator.(:fake_span)
+             :ok
+           end
+         ]},
+        {Appsignal.Span, [:passthrough],
+         [
+           set_sample_data: fn _span, key, value ->
+             send(test_pid, {:appsignal_tag, key, value})
+             :fake_span
+           end
+         ]}
+      ]) do
+        # The original exception is reraised after the failure is reported.
+        assert_raise BadMapError, fn ->
+          Webhook.execute_unified_voice_filesearch(action, context)
+        end
+      end
+
+      assert_receive {:appsignal_exception,
+                      %Webhook.SystemError{
+                        message: "Webhook system_error from unified-voice-llm-call"
+                      }}
+
+      assert_receive {:appsignal_tag, "tags", tags}
+      assert tags.organization_id == 1
+      assert tags.webhook_name == "unified-voice-llm-call"
+      assert tags.reason =~ "map"
+    end
   end
 end

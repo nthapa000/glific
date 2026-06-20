@@ -27,13 +27,13 @@ defmodule GlificWeb.Schema.OrganizationTypes do
     field(:auto_translation_enabled, :boolean)
     field(:whatsapp_group_enabled, :boolean)
     field(:certificate_enabled, :boolean)
-    field(:kaapi_enabled, :boolean)
     field(:ask_glific_enabled, :boolean)
     field(:errors, list_of(:input_error))
     field(:whatsapp_forms_enabled, :boolean)
-    field(:unified_api_enabled, :boolean)
     field(:ai_evaluations_enabled, :boolean)
     field(:assistant_config_versions_enabled, :boolean)
+    field(:copy_node_enabled, :boolean)
+    field(:prompt_generator_enabled, :boolean)
   end
 
   object :organization_export_result do
@@ -141,12 +141,12 @@ defmodule GlificWeb.Schema.OrganizationTypes do
     field(:is_auto_translation_enabled, :boolean)
     field(:is_whatsapp_group_enabled, :boolean)
     field(:is_certificate_enabled, :boolean)
-    field(:is_kaapi_enabled, :boolean)
     field(:is_whatsapp_forms_enabled, :boolean)
+    field(:is_copy_node_enabled, :boolean)
     field(:is_trial_org, :boolean)
     field(:trial_expiration_date, :datetime)
-    field(:unified_api_enabled, :boolean)
     field(:assistant_config_versions_enabled, :boolean)
+    field(:is_prompt_generator_enabled, :boolean)
 
     field(:inserted_at, :datetime)
 
