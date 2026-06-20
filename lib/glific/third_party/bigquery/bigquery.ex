@@ -1,12 +1,32 @@
 defmodule Glific.BigQuery do
   @moduledoc """
-  Glific BigQuery Dataset and table creation
+  Glific BigQuery Dataset and table creation.
+
+  ## Partitioning & clustering (issue #5169)
+
+  New tables are created with BigQuery partitioning/clustering for cheaper queries:
+
+    * **Partitioning** — `MONTH` time-unit partitioning on `inserted_at` for the heavy,
+      time-series tables in `@partitioned_tables` (`messages`, `flow_contexts`,
+      `flow_results`, `contact_histories`, `wa_messages`, `messages_media`). A sandbox cost experiment
+      showed `MONTH` prunes recent-window dashboard queries far better than `YEAR` for
+      large orgs and is never worse.
+    * **Clustering** — per-table keys from `@cluster_fields` (fact, link and `contacts`
+      tables). Partitioned tables cluster by entity keys only; unpartitioned fact tables
+      lead with `inserted_at` for time-range pruning. Each org has its own dataset, so
+      there is no `organization_id` column to cluster on.
+
+  Both are set **only** in `create_table/2` (the insert path). BigQuery cannot add
+  partitioning to an existing table, and inserts against existing tables short-circuit
+  with `ALREADY_EXISTS`, so existing orgs' tables are left untouched. `alter_table/2`
+  (used for schema/column evolution) deliberately does not set these.
   """
 
   require Logger
   use Publicist
 
-  import Ecto.Query, warn: false
+  import Ecto.Query
+  import Glific.SafeLog
 
   alias Glific.{
     BigQuery.BigQueryJob,
@@ -26,6 +46,7 @@ defmodule Glific.BigQuery do
     Groups.ContactWAGroup,
     Groups.Group,
     Groups.WAGroup,
+    Groups.WAGroupPhone,
     Groups.WAGroupsCollection,
     Jobs,
     Messages.Message,
@@ -85,12 +106,53 @@ defmodule Glific.BigQuery do
     "trackers" => :trackers_schema,
     "wa_groups" => :wa_group_schema,
     "wa_groups_collections" => :wa_groups_collection_schema,
+    "wa_groups_phones" => :wa_groups_phones_schema,
     "wa_messages" => :wa_message_schema,
     "wa_reactions" => :wa_reactions_schema,
     "whatsapp_forms" => :whatsapp_form_schema,
     "whatsapp_forms_responses" => :whatsapp_form_response_schema,
     "certificate_templates" => :certificate_templates_schema,
     "issued_certificates" => :issued_certificates_schema
+  }
+
+  # Tables created with BigQuery time-unit partitioning (MONTH on `inserted_at`).
+  # See issue #5169 — a sandbox cost experiment showed MONTH prunes recent-window
+  # dashboard queries far better than YEAR for our heavy orgs, and is never worse.
+  # Only applied at table creation (`create_table/2`); BigQuery cannot repartition
+  # existing tables, so existing orgs are left untouched.
+  @partitioned_tables ~w(messages flow_contexts flow_results contact_histories wa_messages messages_media)
+  @partition_field "inserted_at"
+  @partition_type "MONTH"
+
+  # Per-table clustering keys (highest-selectivity first, max 4). Each org has its
+  # own dataset, so there is no `organization_id` column to cluster on. Partitioned
+  # tables cluster by entity keys only (time is the partition); unpartitioned fact
+  # tables lead with `inserted_at` for time-range pruning; link tables lead with the
+  # parent key. Dimension/config tables are intentionally absent (no measurable win).
+  @cluster_fields %{
+    "messages" => ["contact_phone", "flow_id"],
+    "flow_contexts" => ["contact_phone", "flow_id"],
+    "flow_results" => ["contact_phone", "name"],
+    "contact_histories" => ["phone", "event_type"],
+    "wa_messages" => ["wa_group_id", "contact_phone"],
+    "message_conversations" => ["inserted_at", "phone"],
+    "messages_media" => ["content_type"],
+    "message_broadcasts" => ["inserted_at", "flow_id"],
+    "message_broadcast_contacts" => ["inserted_at", "phone"],
+    "wa_reactions" => ["inserted_at", "phone"],
+    "flow_counts" => ["inserted_at", "flow_uuid"],
+    "tickets" => ["inserted_at", "contact_phone"],
+    "whatsapp_forms_responses" => ["inserted_at", "contact_phone"],
+    "issued_certificates" => ["inserted_at", "phone"],
+    "contacts" => ["phone"],
+    "contacts_groups" => ["group_id", "contact_id"],
+    "contacts_wa_groups" => ["group_id", "phone"],
+    "wa_groups_phones" => ["wa_group_id"],
+    "wa_groups_collections" => ["collection_id", "group_id"],
+    "stats" => ["date", "period"],
+    "stats_all" => ["date", "period"],
+    "trackers" => ["date", "period"],
+    "trackers_all" => ["date", "period"]
   }
 
   @spec bigquery_tables(any) :: %{optional(<<_::40, _::_*8>>) => atom}
@@ -230,6 +292,7 @@ defmodule Glific.BigQuery do
     "trackers_all" => Tracker,
     "wa_groups" => WAGroup,
     "wa_groups_collections" => WAGroupsCollection,
+    "wa_groups_phones" => WAGroupPhone,
     "wa_messages" => WAMessage,
     "wa_reactions" => WaReaction,
     "whatsapp_forms" => WhatsappForm,
@@ -443,6 +506,215 @@ defmodule Glific.BigQuery do
     end
   end
 
+  @doc """
+  Validates BigQuery permissions given a decoded service account credential map.
+
+  Fetches a Goth token from the service account, creates the BigQuery connection,
+  and delegates to `validate_bigquery_permissions/2`. This is the entry point
+  used by `Partners.validate_credential_permissions/2` so that the
+  `GoogleApi.BigQuery.V2.Connection` alias stays within this module.
+
+  Returns `{:ok, :valid}` or `{:error, message}`.
+  """
+  @spec validate_bigquery_credentials(map(), non_neg_integer() | nil) ::
+          {:ok, :valid} | {:error, String.t()}
+  def validate_bigquery_credentials(service_account, organization_id \\ nil) do
+    project_id = service_account["project_id"]
+
+    case Goth.Token.fetch(source: {:service_account, service_account, []}) do
+      {:ok, token} ->
+        conn = Connection.new(token.token)
+        validate_bigquery_permissions(conn, project_id, organization_id)
+
+      {:error, reason} ->
+        {:error, "Error fetching token from service account: #{safe_inspect(reason)}"}
+    end
+  end
+
+  @doc """
+  Validates that the service account has all permissions required for BigQuery sync
+  by performing a dry-run sequence of real API calls against a temporary dataset,
+  then cleaning up.
+
+  Steps:
+    1. Create a temp dataset
+    2. Create a test table
+    3. Insert a test row
+    4. Update the table schema
+    5. Delete the test table
+    6. Delete the temp dataset
+
+  Returns {:ok, :valid} if all operations succeed, or {:error, message} indicating
+  which operation failed and what permission is missing.
+  """
+  @spec validate_bigquery_permissions(Tesla.Client.t(), String.t(), non_neg_integer() | nil) ::
+          {:ok, :valid} | {:error, String.t()}
+  def validate_bigquery_permissions(conn, project_id, organization_id \\ nil) do
+    temp_dataset_id = "glific_permission_test_#{System.unique_integer([:positive, :monotonic])}"
+    temp_table_id = "glific_test_table"
+
+    with {:ok, _} <- do_validate_create_dataset(conn, project_id, temp_dataset_id),
+         {:ok, _} <- do_validate_create_table(conn, project_id, temp_dataset_id, temp_table_id),
+         {:ok, _} <-
+           do_validate_insert_rows(conn, project_id, temp_dataset_id, temp_table_id),
+         {:ok, _} <-
+           do_validate_update_table(conn, project_id, temp_dataset_id, temp_table_id),
+         {:ok, _} <-
+           do_validate_delete_table(conn, project_id, temp_dataset_id, temp_table_id),
+         {:ok, _} <- do_validate_delete_dataset(conn, project_id, temp_dataset_id) do
+      {:ok, :valid}
+    else
+      {:error, reason} ->
+        cleanup_validation_dataset(conn, project_id, temp_dataset_id, organization_id)
+        {:error, reason}
+    end
+  end
+
+  @spec do_validate_create_dataset(Tesla.Client.t(), String.t(), String.t()) ::
+          {:ok, any()} | {:error, String.t()}
+  defp do_validate_create_dataset(conn, project_id, dataset_id) do
+    Datasets.bigquery_datasets_insert(
+      conn,
+      project_id,
+      [body: %{datasetReference: %{datasetId: dataset_id, projectId: project_id}}],
+      []
+    )
+    |> handle_validation_response("create dataset (bigquery.datasets.create)")
+  end
+
+  @spec do_validate_create_table(Tesla.Client.t(), String.t(), String.t(), String.t()) ::
+          {:ok, any()} | {:error, String.t()}
+  defp do_validate_create_table(conn, project_id, dataset_id, table_id) do
+    Tables.bigquery_tables_insert(
+      conn,
+      project_id,
+      dataset_id,
+      [
+        body: %{
+          tableReference: %{
+            datasetId: dataset_id,
+            projectId: project_id,
+            tableId: table_id
+          },
+          schema: %{fields: [%{name: "test_field", type: "STRING", mode: "NULLABLE"}]}
+        }
+      ],
+      []
+    )
+    |> handle_validation_response("create table (bigquery.tables.create)")
+  end
+
+  @spec do_validate_insert_rows(Tesla.Client.t(), String.t(), String.t(), String.t()) ::
+          {:ok, any()} | {:error, String.t()}
+  defp do_validate_insert_rows(conn, project_id, dataset_id, table_id) do
+    Tabledata.bigquery_tabledata_insert_all(
+      conn,
+      project_id,
+      dataset_id,
+      table_id,
+      [body: %{rows: [%{insertId: "test_row_1", json: %{test_field: "hello"}}]}],
+      []
+    )
+    |> handle_validation_response("insert rows (bigquery.tables.updateData)")
+  end
+
+  @spec do_validate_update_table(Tesla.Client.t(), String.t(), String.t(), String.t()) ::
+          {:ok, any()} | {:error, String.t()}
+  defp do_validate_update_table(conn, project_id, dataset_id, table_id) do
+    Tables.bigquery_tables_update(
+      conn,
+      project_id,
+      dataset_id,
+      table_id,
+      [
+        body: %{
+          tableReference: %{
+            datasetId: dataset_id,
+            projectId: project_id,
+            tableId: table_id
+          },
+          schema: %{
+            fields: [
+              %{name: "test_field", type: "STRING", mode: "NULLABLE"},
+              %{name: "test_field_2", type: "INTEGER", mode: "NULLABLE"}
+            ]
+          }
+        }
+      ],
+      []
+    )
+    |> handle_validation_response("update table schema (bigquery.tables.update)")
+  end
+
+  @spec do_validate_delete_table(Tesla.Client.t(), String.t(), String.t(), String.t()) ::
+          {:ok, any()} | {:error, String.t()}
+  defp do_validate_delete_table(conn, project_id, dataset_id, table_id) do
+    Tables.bigquery_tables_delete(conn, project_id, dataset_id, table_id, [])
+    |> handle_validation_response("delete table (bigquery.tables.delete)")
+  end
+
+  @spec do_validate_delete_dataset(Tesla.Client.t(), String.t(), String.t()) ::
+          {:ok, any()} | {:error, String.t()}
+  defp do_validate_delete_dataset(conn, project_id, dataset_id) do
+    Datasets.bigquery_datasets_delete(conn, project_id, dataset_id, [], deleteContents: true)
+    |> handle_validation_response("delete dataset (bigquery.datasets.delete)")
+  end
+
+  @spec handle_validation_response(tuple(), String.t()) ::
+          {:ok, any()} | {:error, String.t()}
+  defp handle_validation_response({:ok, response}, _operation), do: {:ok, response}
+
+  defp handle_validation_response({:error, %{body: body}}, operation) when is_binary(body) do
+    case Jason.decode(body) do
+      {:ok, %{"error" => %{"status" => "PERMISSION_DENIED"}}} ->
+        {:error,
+         "Service account does not have permission to #{operation}. " <>
+           "Please ensure the service account has the BigQuery Data Editor and BigQuery Job User roles. " <>
+           "See: https://glific.github.io/docs/docs/Product%20Features/Others/Bigquery/"}
+
+      {:ok, %{"error" => %{"code" => code, "status" => status}}} ->
+        {:error, "BigQuery validation failed at #{operation} with error #{code}: #{status}"}
+
+      _ ->
+        {:error, "BigQuery validation failed at #{operation}: #{body}"}
+    end
+  end
+
+  defp handle_validation_response({:error, reason}, operation) do
+    {:error, "BigQuery validation failed at #{operation}: #{safe_inspect(reason)}"}
+  end
+
+  @spec cleanup_validation_dataset(
+          Tesla.Client.t(),
+          String.t(),
+          String.t(),
+          non_neg_integer() | nil
+        ) :: :ok
+  defp cleanup_validation_dataset(conn, project_id, dataset_id, organization_id) do
+    case Datasets.bigquery_datasets_delete(conn, project_id, dataset_id, [], deleteContents: true) do
+      {:ok, _} ->
+        :ok
+
+      {:error, err} ->
+        Glific.log_exception(
+          %Partners.CredentialError{
+            message:
+              "Failed to cleanup BQ validation dataset #{dataset_id} in project #{project_id}: #{safe_inspect(err)}",
+            organization_id: organization_id,
+            shortcode: "bigquery"
+          },
+          namespace: "partners",
+          tags: %{
+            organization_id: organization_id,
+            shortcode: "bigquery",
+            reason: "cleanup_failure"
+          }
+        )
+
+        :ok
+    end
+  end
+
   @spec create_dataset(Tesla.Client.t(), String.t(), String.t()) ::
           {:ok, GoogleApi.BigQuery.V2.Model.Dataset.t()} | {:ok, Tesla.Env.t()} | {:error, any()}
   defp create_dataset(conn, project_id, dataset_id) do
@@ -467,24 +739,39 @@ defmodule Glific.BigQuery do
          schema,
          %{conn: conn, dataset_id: dataset_id, project_id: project_id, table_id: table_id} = _cred
        ) do
-    Tables.bigquery_tables_insert(
-      conn,
-      project_id,
-      dataset_id,
-      [
-        body: %{
-          tableReference: %{
-            datasetId: dataset_id,
-            projectId: project_id,
-            tableId: table_id
-          },
-          schema: %{
-            fields: schema
-          }
+    body =
+      %{
+        tableReference: %{
+          datasetId: dataset_id,
+          projectId: project_id,
+          tableId: table_id
+        },
+        schema: %{
+          fields: schema
         }
-      ],
-      []
-    )
+      }
+      |> maybe_add_partitioning(table_id)
+      |> maybe_add_clustering(table_id)
+
+    Tables.bigquery_tables_insert(conn, project_id, dataset_id, [body: body], [])
+  end
+
+  # Adds MONTH time-partitioning on `inserted_at` for the configured tables. Only
+  # honoured by BigQuery when the table is created fresh; inserts against existing
+  # tables short-circuit with ALREADY_EXISTS, so existing orgs stay unpartitioned.
+  @spec maybe_add_partitioning(map(), String.t()) :: map()
+  defp maybe_add_partitioning(body, table_id) when table_id in @partitioned_tables,
+    do: Map.put(body, :timePartitioning, %{type: @partition_type, field: @partition_field})
+
+  defp maybe_add_partitioning(body, _table_id), do: body
+
+  # Adds clustering for tables present in @cluster_fields; a no-op otherwise.
+  @spec maybe_add_clustering(map(), String.t()) :: map()
+  defp maybe_add_clustering(body, table_id) do
+    case Map.get(@cluster_fields, table_id) do
+      [_ | _] = fields -> Map.put(body, :clustering, %{fields: fields})
+      _ -> body
+    end
   end
 
   @spec alter_table(list(), map()) ::
@@ -751,9 +1038,20 @@ defmodule Glific.BigQuery do
         ) AS rn
         FROM `#{credentials.dataset_id}.#{table}` delta
         WHERE updated_at < DATETIME(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR),
-          '#{timezone}')) a WHERE a.rn <> 1 ORDER BY id);
+          '#{timezone}')#{partition_filter(table, timezone)}) a WHERE a.rn <> 1 ORDER BY id);
     """
   end
+
+  # For MONTH-partitioned tables, also bound the dedup scan by `inserted_at` (the
+  # partition key) so BigQuery prunes to recent partitions instead of full-scanning.
+  # These are transactional tables whose `updated_at` stays close to creation, so
+  # duplicates (from re-syncs of recently-updated rows) fall inside a 3-month window.
+  @spec partition_filter(String.t(), String.t()) :: String.t()
+  defp partition_filter(table, timezone) when table in @partitioned_tables,
+    do:
+      "\n    AND #{@partition_field} >= DATETIME(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 MONTH), '#{timezone}')"
+
+  defp partition_filter(_table, _timezone), do: ""
 
   @spec handle_duplicate_removal_job_error(tuple() | nil, String.t(), map(), non_neg_integer) ::
           :ok

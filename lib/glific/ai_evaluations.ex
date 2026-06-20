@@ -11,7 +11,6 @@ defmodule Glific.AIEvaluations do
     AIEvaluations.AIEvaluation,
     AIEvaluations.GoldenQA,
     AIEvaluations.OrganizationEvalRequest,
-    Mails.EvalAccessRequestMail,
     Metrics,
     Notifications,
     Partners,
@@ -19,7 +18,9 @@ defmodule Glific.AIEvaluations do
     ThirdParty.Kaapi
   }
 
-  @timeout_hours 6
+  alias Glific.ThirdParty.Discord.Notifications, as: DiscordNotifications
+
+  @timeout_hours 24
 
   @doc """
   Returns the list of AI evaluations for an organization.
@@ -257,7 +258,7 @@ defmodule Glific.AIEvaluations do
         with {:ok, _} <- result do
           organization_id
           |> Partners.organization()
-          |> EvalAccessRequestMail.send_eval_access_request_mail()
+          |> DiscordNotifications.send_eval_access_request()
         end
 
         result

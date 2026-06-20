@@ -1528,7 +1528,7 @@ defmodule Glific.Flows.ActionTest do
     assert_raise(UndefinedFunctionError, fn -> Action.execute(action, context, message_stream) end)
   end
 
-  test "execute voice-filesearch-gpt action with unified_api_enabled routes to unified voice webhook",
+  test "execute voice-filesearch-gpt action routes to unified voice webhook",
        attrs do
     Partners.organization(attrs.organization_id)
 
@@ -1560,6 +1560,38 @@ defmodule Glific.Flows.ActionTest do
     end
   end
 
+  test "execute filesearch-gpt action routes to unified filesearch webhook",
+       attrs do
+    Partners.organization(attrs.organization_id)
+
+    contact = Repo.get_by(Contact, %{name: "Default receiver"})
+
+    context =
+      %FlowContext{contact_id: contact.id, flow_id: 1, organization_id: attrs.organization_id}
+      |> Repo.preload([:contact, :flow])
+
+    action = %Action{
+      type: "call_webhook",
+      method: "FUNCTION",
+      url: "filesearch-gpt",
+      headers: %{"Accept" => "application/json"},
+      body:
+        Jason.encode!(%{
+          "question" => "What is Glific?",
+          "assistant_id" => "asst_123"
+        }),
+      result_name: "filesearch",
+      node_uuid: "Test UUID"
+    }
+
+    with_mock Webhook,
+      execute_unified_filesearch: fn _action, _context -> {:wait, context, []} end do
+      result = Action.execute(action, context, [])
+      assert {:wait, ^context, []} = result
+      assert called(Webhook.execute_unified_filesearch(action, context))
+    end
+  end
+
   test "execute a wa group unsupported action",
        _attrs do
     [wa_group | _] = WAGroups.list_wa_groups(%{filter: %{limit: 1}})
@@ -1576,5 +1608,47 @@ defmodule Glific.Flows.ActionTest do
     message_stream = []
 
     assert_raise(UndefinedFunctionError, fn -> Action.execute(action, context, message_stream) end)
+  end
+
+  describe "validate/3 — deprecated Bhashini webhooks" do
+    test "flags speech_to_text_with_bhasini with a Critical migration error" do
+      action = %Action{type: "call_webhook", url: "speech_to_text_with_bhasini"}
+
+      assert [{Webhook, message, "Critical"}] = Action.validate(action, [], %{})
+      assert message =~ "speech_to_text_with_bhasini"
+      assert message =~ "speech_to_text"
+      assert message =~ "deprecated"
+    end
+
+    test "flags text_to_speech_with_bhasini and recommends the text_to_speech node" do
+      action = %Action{type: "call_webhook", url: "text_to_speech_with_bhasini"}
+
+      assert [{Webhook, message, "Critical"}] = Action.validate(action, [], %{})
+      assert message =~ "text_to_speech_with_bhasini"
+      assert message =~ "text_to_speech"
+    end
+
+    test "flags nmt_tts_with_bhasini and recommends the text_to_speech node" do
+      action = %Action{type: "call_webhook", url: "nmt_tts_with_bhasini"}
+
+      assert [{Webhook, message, "Critical"}] = Action.validate(action, [], %{})
+      assert message =~ "nmt_tts_with_bhasini"
+      assert message =~ "text_to_speech"
+    end
+
+    test "prepends the error onto the existing error list" do
+      action = %Action{type: "call_webhook", url: "speech_to_text_with_bhasini"}
+      existing = [{Webhook, "some other error", "Warning"}]
+
+      assert [{Webhook, _msg, "Critical"}, {Webhook, "some other error", "Warning"}] =
+               Action.validate(action, existing, %{})
+    end
+
+    test "does not flag the new speech_to_text / text_to_speech webhooks" do
+      for url <- ["speech_to_text", "text_to_speech"] do
+        action = %Action{type: "call_webhook", url: url}
+        assert Action.validate(action, [], %{}) == []
+      end
+    end
   end
 end

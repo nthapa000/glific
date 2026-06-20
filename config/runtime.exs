@@ -118,6 +118,8 @@ config :glific,
 config :glific,
   open_ai: env!("OPEN_AI_KEY", :string!, "This is not a secret")
 
+config :glific, Glific.OpenAI.ChatGPT, gpt_model: env!("OPEN_AI_MODEL", :string, "gpt-5.1")
+
 config :glific,
   gemini_api_key: env!("GEMINI_API_KEY", :string!, "This is not a secret")
 
@@ -165,6 +167,9 @@ config :glific,
 config :glific,
   avni_password: env!("AVNI_PASSWORD", :string!, "This is not a secret")
 
+config :glific,
+  gupshup_partner_client_secret: env!("GUPSHUP_PARTNER_CLIENT_SECRET", :string!, "")
+
 config :glific, Glific.Erase,
   msg_delete_batch_size: env!("MSG_DELETE_BATCH_SIZE", :integer, 100_000),
   max_msg_rows_to_delete: env!("MAX_MSG_ROWS_TO_DELETE", :integer, 2_000_000)
@@ -185,6 +190,10 @@ config :glific, Glific.ThirdParty.Kaapi.ApiClient,
   kaapi_api_key: env!("KAAPI_API_KEY", :string, "This is not a secret"),
   upload_adapter: upload_adapter
 
+config :glific, Glific.ThirdParty.Kaapi,
+  stt_model: env!("KAAPI_STT_MODEL", :string, "gemini-3.1-pro-preview"),
+  tts_model: env!("KAAPI_TTS_MODEL", :string, "gemini-3.1-flash-tts-preview")
+
 config :glific, Glific.ThirdParty.Gemini.ApiClient,
   gemini_api_key: env!("GEMINI_API_KEY", :string, "This is not a secret"),
   stt_model: env!("GEMINI_STT_MODEL", :string, "gemini-2.5-pro"),
@@ -192,7 +201,8 @@ config :glific, Glific.ThirdParty.Gemini.ApiClient,
 
 config :glific,
   base_domain: env!("GLIFIC_BASE_DOMAIN", :string, "glific.com"),
-  api_host_override: env!("GLIFIC_API_HOST_OVERRIDE", :string, nil)
+  api_host_override: env!("GLIFIC_API_HOST_OVERRIDE", :string, nil),
+  discord_webhook_url: env!("DISCORD_WEBHOOK_URL", :string, nil)
 
 search_repo_module =
   if(env!("USE_REPLICA_DB", :boolean, false), do: Glific.RepoReplica, else: Glific.Repo)

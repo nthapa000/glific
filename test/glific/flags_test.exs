@@ -187,13 +187,34 @@ defmodule Glific.FlagsTest do
            ) == false
   end
 
-  test "get_flag_enabled/2 correctly reflects unified_api_enabled flag state" do
+  test "get_flag_enabled/2 correctly reflects high_trigger_tps_enabled flag state" do
     organization = Fixtures.organization_fixture()
 
-    FunWithFlags.enable(:unified_api_enabled, for_actor: %{organization_id: organization.id})
-    assert Flags.get_flag_enabled(:unified_api_enabled, organization) == true
+    FunWithFlags.enable(:high_trigger_tps_enabled, for_actor: %{organization_id: organization.id})
+    assert Flags.get_flag_enabled(:high_trigger_tps_enabled, organization) == true
 
-    FunWithFlags.disable(:unified_api_enabled, for_actor: %{organization_id: organization.id})
-    assert Flags.get_flag_enabled(:unified_api_enabled, organization) == false
+    FunWithFlags.disable(:high_trigger_tps_enabled,
+      for_actor: %{organization_id: organization.id}
+    )
+
+    assert Flags.get_flag_enabled(:high_trigger_tps_enabled, organization) == false
+  end
+
+  test "set_flag_enabled/2 hydrates is_prompt_generator_enabled from the flag state" do
+    organization = Fixtures.organization_fixture()
+
+    FunWithFlags.enable(:is_prompt_generator_enabled,
+      for_actor: %{organization_id: organization.id}
+    )
+
+    assert %{is_prompt_generator_enabled: true} =
+             Flags.set_flag_enabled(organization, :is_prompt_generator_enabled)
+
+    FunWithFlags.disable(:is_prompt_generator_enabled,
+      for_actor: %{organization_id: organization.id}
+    )
+
+    assert %{is_prompt_generator_enabled: false} =
+             Flags.set_flag_enabled(organization, :is_prompt_generator_enabled)
   end
 end
