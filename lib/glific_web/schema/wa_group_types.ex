@@ -27,6 +27,11 @@ defmodule GlificWeb.Schema.WaGroupTypes do
       resolve(dataloader(Repo))
     end
 
+    @desc "The managed phone for this group (alias for wa_managed_phone, used by the frontend as primaryPhone)"
+    field :primary_phone, :wa_managed_phone do
+      resolve(dataloader(Repo, :wa_managed_phone))
+    end
+
     field :groups, list_of(:group) do
       resolve(dataloader(Repo, use_parent: true))
     end
