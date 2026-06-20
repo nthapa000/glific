@@ -162,7 +162,7 @@ defmodule Glific.Appsignal do
 
   @ignore_plugins [
     Elixir.Oban.Plugins.Stager,
-    Elixir.Oban.Pro.Plugins.DynamicLifeline,
+    Elixir.Oban.Plugins.Lifeline,
     Elixir.Oban.Plugins.Pruner,
     Elixir.Oban.Plugins.Reindexer
   ]
