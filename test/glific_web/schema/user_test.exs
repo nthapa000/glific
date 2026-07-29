@@ -192,6 +192,53 @@ defmodule GlificWeb.Schema.UserTest do
     assert key == "OTP"
   end
 
+  test "update current user email requires a verified otp", %{manager: user} do
+    user = user |> Repo.preload(:contact)
+    Fixtures.otp_hsm_fixture()
+
+    name = "User Test Name New"
+    original_email = Repo.get!(User, user.id).email
+
+    # an unverified otp should not be able to change the email
+    result =
+      auth_query_gql_by(:update_current, user,
+        variables: %{
+          "input" => %{"name" => name, "otp" => "incorrect_otp", "email" => "attacker@domain.com"}
+        }
+      )
+
+    assert {:ok, query_data} = result
+
+    key = get_in(query_data, [:data, "updateCurrentUser", "errors", Access.at(0), "key"])
+    assert key == "OTP"
+    assert Repo.get!(User, user.id).email == original_email
+
+    # neither should a missing otp
+    result =
+      auth_query_gql_by(:update_current, user,
+        variables: %{"input" => %{"name" => name, "email" => "attacker@domain.com"}}
+      )
+
+    assert {:ok, query_data} = result
+
+    key = get_in(query_data, [:data, "updateCurrentUser", "errors", Access.at(0), "key"])
+    assert key == "OTP"
+    assert Repo.get!(User, user.id).email == original_email
+
+    # a verified otp should update the email
+    {:ok, otp} = RegistrationController.create_and_send_verification_code(user.contact)
+
+    result =
+      auth_query_gql_by(:update_current, user,
+        variables: %{"input" => %{"name" => name, "otp" => otp, "email" => "new@example.com"}}
+      )
+
+    assert {:ok, query_data} = result
+
+    assert get_in(query_data, [:data, "updateCurrentUser", "errors"]) == nil
+    assert Repo.get!(User, user.id).email == "new@example.com"
+  end
+
   test "delete a user", %{manager: user_auth} do
     user = Fixtures.user_fixture()
 
