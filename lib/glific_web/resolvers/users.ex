@@ -37,12 +37,16 @@ defmodule GlificWeb.Resolvers.Users do
           {:ok, any} | {:error, any}
   def current_user(_, _, %{context: %{current_user: current_user}}) do
 <<<<<<< HEAD
+<<<<<<< HEAD
     with {:ok, user} <-
            Repo.fetch_by(User, %{
              id: current_user.id,
              organization_id: current_user.organization_id
            }),
          do: {:ok, %{user: user}}
+=======
+    {:ok, %{user: current_user}}
+>>>>>>> 191677afd74555665f6ee8f5bb9b9ccc5fe12f5d
 =======
     {:ok, %{user: current_user}}
 >>>>>>> 191677afd74555665f6ee8f5bb9b9ccc5fe12f5d
@@ -67,6 +71,10 @@ defmodule GlificWeb.Resolvers.Users do
   @spec update_password_params(User.t(), map()) :: {:ok, map()} | {:error, any}
   defp update_password_params(user, params) do
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+    # `email` always requires a verified OTP; the password branch keeps its existing contract
+>>>>>>> 191677afd74555665f6ee8f5bb9b9ccc5fe12f5d
 =======
     # `email` always requires a verified OTP; the password branch keeps its existing contract
 >>>>>>> 191677afd74555665f6ee8f5bb9b9ccc5fe12f5d

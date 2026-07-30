@@ -193,6 +193,7 @@ defmodule GlificWeb.Schema.UserTest do
   end
 
 <<<<<<< HEAD
+<<<<<<< HEAD
   test "update current user cannot change email without a verified otp", %{manager: user} do
     Fixtures.otp_hsm_fixture()
     original_email = Repo.get!(User, user.id).email
@@ -201,6 +202,8 @@ defmodule GlificWeb.Schema.UserTest do
       auth_query_gql_by(:update_current, user,
         variables: %{"input" => %{"otp" => "000000", "email" => "demo@domain.com"}}
 =======
+=======
+>>>>>>> 191677afd74555665f6ee8f5bb9b9ccc5fe12f5d
   test "update current user email requires a verified otp", %{manager: user} do
     user = user |> Repo.preload(:contact)
     Fixtures.otp_hsm_fixture()
@@ -214,17 +217,23 @@ defmodule GlificWeb.Schema.UserTest do
         variables: %{
           "input" => %{"name" => name, "otp" => "incorrect_otp", "email" => "attacker@domain.com"}
         }
+<<<<<<< HEAD
+>>>>>>> 191677afd74555665f6ee8f5bb9b9ccc5fe12f5d
+=======
 >>>>>>> 191677afd74555665f6ee8f5bb9b9ccc5fe12f5d
       )
 
     assert {:ok, query_data} = result
 
 <<<<<<< HEAD
+<<<<<<< HEAD
     assert get_in(query_data, [:data, "updateCurrentUser", "errors", Access.at(0), "key"]) ==
              "OTP"
 
     assert Repo.get!(User, user.id).email == original_email
 =======
+=======
+>>>>>>> 191677afd74555665f6ee8f5bb9b9ccc5fe12f5d
     key = get_in(query_data, [:data, "updateCurrentUser", "errors", Access.at(0), "key"])
     assert key == "OTP"
     assert Repo.get!(User, user.id).email == original_email
@@ -253,6 +262,9 @@ defmodule GlificWeb.Schema.UserTest do
 
     assert get_in(query_data, [:data, "updateCurrentUser", "errors"]) == nil
     assert Repo.get!(User, user.id).email == "new@example.com"
+<<<<<<< HEAD
+>>>>>>> 191677afd74555665f6ee8f5bb9b9ccc5fe12f5d
+=======
 >>>>>>> 191677afd74555665f6ee8f5bb9b9ccc5fe12f5d
   end
 
